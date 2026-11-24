@@ -1,0 +1,15 @@
+﻿.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,439 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lab-only AWS cloud security monitoring stack with CloudTrail, EventBridge,
+  SNS alerting, and Lambda remediation for S3 and security-group misconfigurations.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for SNS alerts. The subscription must be confirmed.
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: Enter a valid email address or leave blank.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  LabBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Purpose
+          Value: SecurityIncidentResponseLab
+        - Key: Data
+          Value: NoProductionData
+
+  TrailLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLabTrailLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Purpose
+          Value: CloudTrailLogs
+
+  TrailLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailLogBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-trail
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${TrailLogBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-trail
+
+  SecurityTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailLogBucketPolicy
+    Properties:
+      TrailName: !Sub '${AWS::StackName}-trail'
+      S3BucketName: !Ref TrailLogBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - IncludeManagementEvents: true
+          ReadWriteType: All
+      Tags:
+        - Key: Purpose
+          Value: SecurityMonitoring
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Cloud Security Incident Alerts
+      TopicName: !Sub '${AWS::StackName}-alerts'
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref AlertTopic
+
+  AlertLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PublishIncidentAlerts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  AlertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-alert'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt AlertLambdaRole.Arn
+      Environment:
+        Variables:
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          sns = boto3.client("sns")
+          def handler(event, context):
+              detail = event.get("detail", {})
+              identity = detail.get("userIdentity", {})
+              request = detail.get("requestParameters", {})
+              message = {
+                  "alertType": "SuspiciousCloudApiCall",
+                  "eventName": detail.get("eventName"),
+                  "eventSource": detail.get("eventSource"),
+                  "eventTime": detail.get("eventTime"),
+                  "awsRegion": detail.get("awsRegion"),
+                  "account": event.get("account"),
+                  "sourceIp": detail.get("sourceIPAddress"),
+                  "userAgent": detail.get("userAgent"),
+                  "principalArn": identity.get("arn"),
+                  "principalType": identity.get("type"),
+                  "requestParameters": request,
+                  "eventId": detail.get("eventID"),
+                  "rule": event.get("detail-type")
+              }
+              response = sns.publish(
+                  TopicArn=os.environ["ALERT_TOPIC_ARN"],
+                  Subject="AWS Security API Alert",
+                  Message=json.dumps(message, indent=2, default=str)
+              )
+              return {"status": "published", "messageId": response.get("MessageId")}
+
+  S3RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ContainLabBucketPublicAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:PutBucketPublicAccessBlock
+                Resource: !GetAtt LabBucket.Arn
+
+  S3RemediationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-remediate-s3'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt S3RemediationRole.Arn
+      Environment:
+        Variables:
+          LAB_BUCKET: !Ref LabBucket
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          from botocore.exceptions import ClientError
+          s3 = boto3.client("s3")
+          def is_public_allow(statement):
+              if statement.get("Effect") != "Allow":
+                  return False
+              principal = statement.get("Principal")
+              wildcard = principal == "*"
+              if isinstance(principal, dict):
+                  wildcard = any(v == "*" or (isinstance(v, list) and "*" in v)
+                                 for v in principal.values())
+              return wildcard and not statement.get("Condition")
+          def handler(event, context):
+              detail = event.get("detail", {})
+              bucket = detail.get("requestParameters", {}).get("bucketName") or os.environ["LAB_BUCKET"]
+              if bucket != os.environ["LAB_BUCKET"]:
+                  return {"status": "skipped", "reason": "bucket outside lab scope"}
+              s3.put_public_access_block(
+                  Bucket=bucket,
+                  PublicAccessBlockConfiguration={
+                      "BlockPublicAcls": True, "IgnorePublicAcls": True,
+                      "BlockPublicPolicy": True, "RestrictPublicBuckets": True
+                  })
+              policy_action = "unchanged"
+              try:
+                  policy = json.loads(s3.get_bucket_policy(Bucket=bucket)["Policy"])
+                  statements = policy.get("Statement", [])
+                  if not isinstance(statements, list):
+                      statements = [statements]
+                  kept = [s for s in statements if not is_public_allow(s)]
+                  if len(kept) != len(statements):
+                      if kept:
+                          policy["Statement"] = kept
+                          s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(policy))
+                      else:
+                          s3.delete_bucket_policy(Bucket=bucket)
+                      policy_action = "removed-public-allow-statements"
+              except ClientError as exc:
+                  if exc.response.get("Error", {}).get("Code") not in ("NoSuchBucketPolicy", "NoSuchBucketPolicyException"):
+                      raise
+              return {"status": "contained", "bucket": bucket, "policyAction": policy_action}
+
+  SecurityGroupRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RevokeRiskyWorldIngress
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: '*'
+
+  SecurityGroupRemediationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-remediate-sg'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt SecurityGroupRemediationRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          ec2 = boto3.client("ec2")
+          SENSITIVE_PORTS = {22, 3389, 3306, 5432, 1433, 27017, 6379}
+          def is_world(cidr):
+              return cidr in ("0.0.0.0/0", "::/0")
+          def handler(event, context):
+              params = event.get("detail", {}).get("requestParameters", {})
+              group_id = params.get("groupId")
+              if not group_id:
+                  return {"status": "skipped", "reason": "no groupId in event"}
+              group = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
+              revoked = []
+              for permission in group.get("IpPermissions", []):
+                  protocol = permission.get("IpProtocol")
+                  from_port = permission.get("FromPort", -1)
+                  to_port = permission.get("ToPort", -1)
+                  risky_port = protocol == "-1" or any(
+                      from_port <= p <= to_port for p in SENSITIVE_PORTS
+                  )
+                  if not risky_port:
+                      continue
+                  risky_v4 = [r for r in permission.get("IpRanges", []) if is_world(r.get("CidrIp"))]
+                  risky_v6 = [r for r in permission.get("Ipv6Ranges", []) if is_world(r.get("CidrIpv6"))]
+                  if not risky_v4 and not risky_v6:
+                      continue
+                  exact = {
+                      "IpProtocol": protocol,
+                      "IpRanges": [{"CidrIp": r["CidrIp"]} for r in risky_v4],
+                      "Ipv6Ranges": [{"CidrIpv6": r["CidrIpv6"]} for r in risky_v6]
+                  }
+                  if "FromPort" in permission: exact["FromPort"] = from_port
+                  if "ToPort" in permission: exact["ToPort"] = to_port
+                  ec2.revoke_security_group_ingress(GroupId=group_id, IpPermissions=[exact])
+                  revoked.append(exact)
+              return {"status": "remediated" if revoked else "no-risky-world-ingress",
+                      "groupId": group_id, "revokedPermissions": revoked}
+
+  SuspiciousApiAlertRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Alerts on selected security-sensitive management API calls.
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3, aws.ec2, aws.cloudtrail]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+            - ec2.amazonaws.com
+            - cloudtrail.amazonaws.com
+          eventName:
+            - PutBucketAcl
+            - PutBucketPolicy
+            - DeleteBucketPolicy
+            - DeletePublicAccessBlock
+            - PutPublicAccessBlock
+            - PutBucketOwnershipControls
+            - AuthorizeSecurityGroupIngress
+            - RevokeSecurityGroupIngress
+            - ModifySecurityGroupRules
+            - StopLogging
+            - DeleteTrail
+      Targets:
+        - Arn: !GetAtt AlertLambda.Arn
+          Id: AlertLambdaTarget
+
+  S3RemediationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Contains the lab bucket after bucket-access control changes.
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [s3.amazonaws.com]
+          eventName:
+            - PutBucketAcl
+            - PutBucketPolicy
+            - DeleteBucketPolicy
+            - DeletePublicAccessBlock
+            - PutBucketOwnershipControls
+      Targets:
+        - Arn: !GetAtt S3RemediationLambda.Arn
+          Id: S3RemediationTarget
+
+  SecurityGroupRemediationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Remediates world-open ingress after security-group ingress changes.
+      State: ENABLED
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ec2.amazonaws.com]
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - ModifySecurityGroupRules
+      Targets:
+        - Arn: !GetAtt SecurityGroupRemediationLambda.Arn
+          Id: SecurityGroupRemediationTarget
+
+  AllowEventBridgeInvokeAlert:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SuspiciousApiAlertRule.Arn
+
+  AllowEventBridgeInvokeS3Remediation:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3RemediationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3RemediationRule.Arn
+
+  AllowEventBridgeInvokeSGRemediation:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityGroupRemediationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityGroupRemediationRule.Arn
+
+Outputs:
+  LabBucketName:
+    Description: Intentionally weakly configured lab bucket (no public policy or objects).
+    Value: !Ref LabBucket
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  CloudTrailLogBucketName:
+    Value: !Ref TrailLogBucket
+  CloudTrailName:
+    Value: !Ref SecurityTrail
+  AlertLambdaName:
+    Value: !Ref AlertLambda
+  S3RemediationLambdaName:
+    Value: !Ref S3RemediationLambda
+  SecurityGroupRemediationLambdaName:
+    Value: !Ref SecurityGroupRemediationLambda
